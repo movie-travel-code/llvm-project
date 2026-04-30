@@ -5946,12 +5946,54 @@ KernelSet llvm::omp::getDeviceKernels(Module &M) {
   return Kernels;
 }
 
+// Return true iff any OpenMP runtime entry point declared in OMPKinds.def is
+// present in \p M and has at least one call-site user. Only call uses are
+// considered; references from things like @llvm.used, bitcasts stored in
+// metadata, or other non-call ConstantExpr uses do not count.
+static bool hasAnyOpenMPRuntimeCall(Module &M) {
+  auto HasCallUser = [](const Function &F) {
+    return llvm::any_of(F.users(),
+                        [](const User *U) { return isa<CallBase>(U); });
+  };
+
+#define OMP_TYPE(...)
+#define OMP_ARRAY_TYPE(...)
+#define OMP_FUNCTION_TYPE(...)
+#define OMP_STRUCT_TYPE(...)
+#define OMP_RTL(_Enum, _Name, _IsVarArg, _ReturnType, ...)                     \
+  if (const Function *F = M.getFunction(_Name))                                \
+    if (HasCallUser(*F))                                                       \
+      return true;
+#include "llvm/Frontend/OpenMP/OMPKinds.def"
+#undef OMP_RTL
+#undef OMP_STRUCT_TYPE
+#undef OMP_FUNCTION_TYPE
+#undef OMP_ARRAY_TYPE
+#undef OMP_TYPE
+
+  return false;
+}
+
 bool llvm::omp::containsOpenMP(Module &M) {
-  Metadata *MD = M.getModuleFlag("openmp");
-  if (!MD)
+  if (!M.getModuleFlag("openmp"))
     return false;
 
-  return true;
+  // Device modules may rely on OpenMP metadata/calling conventions even if
+  // runtime calls are not trivially observable.
+  if (M.getModuleFlag("openmp-device"))
+    return true;
+
+  // Be conservative for offloading/device-kernel modules. Some intermediate IR
+  // states may carry OpenMP device kernels even when host runtime uses are not
+  // visible in the call-site check below.
+  if (!getDeviceKernels(M).empty())
+    return true;
+
+  // For host modules, check whether any known OpenMP runtime entry point is
+  // actually called. Note: this is stricter than the historical "openmp"
+  // module-flag-only check; modules whose OpenMP runtime calls have all been
+  // optimized away will now be reported as not containing OpenMP.
+  return hasAnyOpenMPRuntimeCall(M);
 }
 
 bool llvm::omp::isOpenMPDevice(Module &M) {
